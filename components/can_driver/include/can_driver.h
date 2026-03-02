@@ -23,7 +23,7 @@ extern "C" {
  * SN65HVD230 CANL -> Vehicle CAN_L
  */
 
-#define CAN_TX_GPIO 5
+#define CAN_TX_GPIO 22
 #define CAN_RX_GPIO 4
 #define CAN_BAUDRATE 500000  // OBD-II standard: 500 kbps
 
@@ -73,6 +73,20 @@ bool can_message_available(void);
  * @return true if driver is initialized and running
  */
 bool can_driver_is_running(void);
+
+// Debug info from TWAI controller
+typedef struct {
+    uint8_t state;           // 0=Stopped, 1=Running, 2=Bus-off, 3=Recovering
+    uint32_t tx_error_counter;
+    uint32_t rx_error_counter;
+    uint32_t tx_failed_count;
+    uint32_t rx_missed_count;
+    uint32_t bus_error_count;
+    uint32_t arb_lost_count;
+    uint32_t msgs_to_rx;
+} can_debug_info_t;
+
+esp_err_t can_driver_get_debug_info(can_debug_info_t *info);
 
 #ifdef __cplusplus
 }

@@ -60,7 +60,7 @@ void vehicle_data_update(vehicle_data_t *data, uint8_t pid, float value) {
             data->timing_advance = (int8_t)value;
             break;
         case PID_CONTROL_MODULE_VOLTAGE:
-            data->battery_voltage = (uint16_t)value;
+            data->battery_voltage = (uint16_t)(value * 1000.0f);
             break;
         case PID_FUEL_LEVEL:
             data->fuel_level = (uint8_t)value;

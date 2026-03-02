@@ -11,7 +11,7 @@
 // ============================================================================
 
 // ESP32 GPIO pins for CAN communication
-#define CAN_TX_GPIO 5                   // TWAI_TX pin
+#define CAN_TX_GPIO 22                  // TWAI_TX pin
 #define CAN_RX_GPIO 4                   // TWAI_RX pin
 
 // ============================================================================

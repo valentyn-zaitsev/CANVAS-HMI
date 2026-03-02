@@ -9,39 +9,20 @@
 extern "C" {
 #endif
 
-/**
- * CAN Manager - Handles periodic OBD-II PID requests and responses
- */
+typedef struct {
+    uint32_t request_count;
+    uint32_t response_count;
+    uint32_t error_count;
+    uint8_t last_response_pid;
+    float last_response_value;
+} can_manager_stats_t;
 
-/**
- * Initialize CAN manager
- * @return ESP_OK on success
- */
 esp_err_t can_manager_init(void);
-
-/**
- * Deinitialize CAN manager
- * @return ESP_OK on success
- */
 esp_err_t can_manager_deinit(void);
-
-/**
- * Start CAN manager task
- * @return ESP_OK on success
- */
 esp_err_t can_manager_start(void);
-
-/**
- * Stop CAN manager task
- * @return ESP_OK on success
- */
 esp_err_t can_manager_stop(void);
-
-/**
- * Check if CAN manager is running
- * @return true if running
- */
 bool can_manager_is_running(void);
+const can_manager_stats_t* can_manager_get_stats(void);
 
 #ifdef __cplusplus
 }
