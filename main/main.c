@@ -117,26 +117,30 @@ static lv_chart_series_t *ser_coolant = NULL;
 static lv_chart_series_t *ser_trans = NULL;
 static lv_chart_series_t *ser_ambient = NULL;
 
-static int32_t data_oil[CHART_POINTS] = {
-    20, 28, 38, 50, 60, 68, 75, 80, 84, 87,
-    90, 92, 93, 94, 95, 96, 95, 97, 96, 95,
-    94, 96, 97, 95, 94
-};
-static int32_t data_coolant[CHART_POINTS] = {
-    20, 32, 45, 58, 68, 75, 80, 83, 85, 86,
-    87, 88, 87, 88, 89, 88, 87, 88, 89, 88,
-    87, 88, 87, 88, 87
-};
-static int32_t data_trans[CHART_POINTS] = {
-    18, 24, 32, 42, 52, 60, 66, 70, 74, 76,
-    78, 80, 81, 82, 83, 82, 83, 84, 83, 82,
-    83, 84, 83, 82, 81
-};
-static int32_t data_ambient[CHART_POINTS] = {
-    15, 16, 17, 18, 19, 20, 21, 22, 23, 22,
-    21, 20, 19, 18, 19, 20, 21, 22, 23, 24,
-    23, 22, 21, 20, 19
-};
+// Timeline data (emulated 2 hours, 1 sample/min)
+#define TIMELINE_POINTS 120
+static int32_t tl_oil[TIMELINE_POINTS];
+static int32_t tl_coolant[TIMELINE_POINTS];
+static int32_t tl_trans[TIMELINE_POINTS];
+static int32_t tl_ambient[TIMELINE_POINTS];
+
+// Display buffers (downsampled for chart)
+static int32_t disp_oil[CHART_POINTS];
+static int32_t disp_coolant[CHART_POINTS];
+static int32_t disp_trans[CHART_POINTS];
+static int32_t disp_ambient[CHART_POINTS];
+
+// Range slider state
+#define RANGE_CHART_H 195
+#define RANGE_SLIDER_Y (RANGE_CHART_H + 28)
+#define RANGE_SLIDER_H 16
+static int range_start = 0, range_end = TIMELINE_POINTS - 1;
+static int range_drag = 0; // 0=none, 1=left, 2=right
+static lv_obj_t *range_bg = NULL, *range_fill = NULL;
+static lv_obj_t *range_hl = NULL, *range_hr = NULL;
+static lv_obj_t *range_ll = NULL, *range_lr = NULL;
+static int range_bar_x = 0, range_bar_w = 0; // set during build
+static lv_obj_t *temp_ser_labels[4] = {NULL}; // series name labels (repositioned on range change)
 
 // Screen 3: Speeds/RPM
 static lv_obj_t *chart_speed = NULL;
@@ -319,6 +323,7 @@ typedef struct {
     lv_color_t color;
     int32_t *data;
     lv_chart_series_t **series_ptr;
+    lv_chart_axis_t axis;  // LV_CHART_AXIS_PRIMARY_Y or SECONDARY_Y
 } chart_series_cfg_t;
 
 // Chart layout constants
@@ -330,11 +335,12 @@ typedef struct {
 typedef struct {
     int32_t *data[8];
     lv_color_t colors[8];
+    int s_y_min[8], s_y_max[8];  // per-series Y range (for dual axis)
     int num_series;
     int y_min, y_max;
     const char **x_labels;
     int x_count;
-    int chart_x, chart_w;
+    int chart_x, chart_w, chart_h;
 } chart_info_t;
 
 static chart_info_t chart_infos[4];
@@ -380,7 +386,7 @@ static void chart_screen_touch_cb(lv_event_t *e) {
         int cx = info->chart_x + CHART_PAD;
         int cy = CONTENT_TOP + CHART_Y + CHART_PAD;
         int cw = info->chart_w - 2 * CHART_PAD;
-        int ch = CHART_H - 2 * CHART_PAD;
+        int ch = info->chart_h - 2 * CHART_PAD;
 
         if (tp.x < cx || tp.x > cx + cw || tp.y < cy || tp.y > cy + ch) return;
 
@@ -392,14 +398,16 @@ static void chart_screen_touch_cb(lv_event_t *e) {
         int ry = tp.y - cy;
         int best = 0, bdist = 999999;
         for (int s = 0; s < info->num_series; s++) {
-            int vy = ch - ((info->data[s][pt] - info->y_min) * ch / (info->y_max - info->y_min));
+            int sy_min = info->s_y_min[s], sy_max = info->s_y_max[s];
+            int vy = ch - ((info->data[s][pt] - sy_min) * ch / (sy_max - sy_min));
             int d = abs(ry - vy);
             if (d < bdist) { bdist = d; best = s; }
         }
 
         int snap_x = cx + (pt * cw / (CHART_POINTS - 1));
         int32_t val = info->data[best][pt];
-        int snap_y = cy + ch - ((val - info->y_min) * ch / (info->y_max - info->y_min));
+        int b_ymin = info->s_y_min[best], b_ymax = info->s_y_max[best];
+        int snap_y = cy + ch - ((val - b_ymin) * ch / (b_ymax - b_ymin));
 
         lv_color_t cc = info->colors[best];
 
@@ -425,11 +433,19 @@ static void chart_screen_touch_cb(lv_event_t *e) {
         // Interpolate time between x labels for exact point
         char xbuf[8];
         {
-            int sh = 0, sm = 0, eh = 0, em = 0;
-            sscanf(info->x_labels[0], "%d:%d", &sh, &sm);
-            sscanf(info->x_labels[info->x_count - 1], "%d:%d", &eh, &em);
-            int t0 = sh * 60 + sm, t1 = eh * 60 + em;
-            int t = t0 + pt * (t1 - t0) / (CHART_POINTS - 1);
+            int t0m, t1m;
+            if (current_screen == 1) {
+                // Use range slider time (emulated: 08:00 + range_start..range_end minutes)
+                t0m = 8 * 60 + range_start;
+                t1m = 8 * 60 + range_end;
+            } else {
+                int sh = 0, sm = 0, eh = 0, em = 0;
+                sscanf(info->x_labels[0], "%d:%d", &sh, &sm);
+                sscanf(info->x_labels[info->x_count - 1], "%d:%d", &eh, &em);
+                t0m = sh * 60 + sm;
+                t1m = eh * 60 + em;
+            }
+            int t = t0m + pt * (t1m - t0m) / (CHART_POINTS - 1);
             lv_snprintf(xbuf, sizeof(xbuf), "%d:%02d", t / 60, t % 60);
         }
         lv_label_set_text(cross_xl, xbuf);
@@ -437,7 +453,7 @@ static void chart_screen_touch_cb(lv_event_t *e) {
         int lx = snap_x - 15;
         if (lx < info->chart_x) lx = info->chart_x;
         if (lx > info->chart_x + info->chart_w - 40) lx = info->chart_x + info->chart_w - 40;
-        lv_obj_set_pos(cross_xl, lx, CONTENT_TOP + CHART_H + 2);
+        lv_obj_set_pos(cross_xl, lx, CONTENT_TOP + info->chart_h + 2);
         lv_obj_clear_flag(cross_xl, LV_OBJ_FLAG_HIDDEN);
 
     } else if (code == LV_EVENT_RELEASED) {
@@ -447,33 +463,207 @@ static void chart_screen_touch_cb(lv_event_t *e) {
     }
 }
 
+// ============================================================================
+// Timeline data generation & downsampling
+// ============================================================================
+static void generate_timeline_data(void) {
+    for (int i = 0; i < TIMELINE_POINTS; i++) {
+        // Simulate engine warmup then cruising with variations
+        int phase = i < 30 ? i : 30; // warmup in first 30 min
+        tl_oil[i] = 20 + phase * 2 + (i > 30 ? 25 + ((i * 7 + 13) % 11) - 5 : 0);
+        tl_coolant[i] = 20 + phase * 2 + (i > 30 ? 18 + ((i * 11 + 7) % 7) - 3 : 0);
+        tl_trans[i] = 18 + (phase * 18) / 10 + (i > 30 ? 20 + ((i * 13 + 5) % 9) - 4 : 0);
+        tl_ambient[i] = 15 + ((i * 3 + 17) % 11) - 3;
+        // Clamp
+        if (tl_oil[i] > 115) tl_oil[i] = 115;
+        if (tl_coolant[i] > 95) tl_coolant[i] = 95;
+        if (tl_trans[i] > 90) tl_trans[i] = 90;
+    }
+}
+
+static void downsample_range(int32_t *src, int32_t *dst, int start, int end) {
+    int rlen = end - start + 1;
+    if (rlen < 1) rlen = 1;
+    for (int i = 0; i < CHART_POINTS; i++) {
+        int bs = start + i * rlen / CHART_POINTS;
+        int be = start + (i + 1) * rlen / CHART_POINTS;
+        if (be > end + 1) be = end + 1;
+        if (be <= bs) be = bs + 1;
+        if (be > TIMELINE_POINTS) be = TIMELINE_POINTS;
+        int32_t sum = 0, cnt = 0;
+        for (int j = bs; j < be; j++) { sum += src[j]; cnt++; }
+        dst[i] = cnt > 0 ? sum / cnt : 0;
+    }
+}
+
+static void update_range_visuals(void);
+
+static void update_chart_from_range(void) {
+    downsample_range(tl_oil, disp_oil, range_start, range_end);
+    downsample_range(tl_coolant, disp_coolant, range_start, range_end);
+    downsample_range(tl_trans, disp_trans, range_start, range_end);
+    downsample_range(tl_ambient, disp_ambient, range_start, range_end);
+    if (chart_temp) lv_chart_refresh(chart_temp);
+
+    // Reposition series labels to follow last data point
+    if (temp_ser_labels[0]) {
+        int32_t *bufs[4] = {disp_oil, disp_coolant, disp_trans, disp_ambient};
+        int content_h = RANGE_CHART_H - 2 * CHART_PAD;
+        int y_min = -10, y_max = 120;
+        int label_y[4];
+        for (int i = 0; i < 4; i++) {
+            int32_t last_val = bufs[i][CHART_POINTS - 1];
+            label_y[i] = CHART_PAD + content_h - ((last_val - y_min) * content_h / (y_max - y_min)) - 6;
+            if (label_y[i] < 0) label_y[i] = 0;
+            if (label_y[i] > RANGE_CHART_H - 14) label_y[i] = RANGE_CHART_H - 14;
+        }
+        // Sort and de-overlap
+        int order[4] = {0, 1, 2, 3};
+        for (int i = 0; i < 3; i++)
+            for (int j = i + 1; j < 4; j++)
+                if (label_y[order[i]] > label_y[order[j]]) {
+                    int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+                }
+        for (int i = 1; i < 4; i++) {
+            if (label_y[order[i]] - label_y[order[i-1]] < 14)
+                label_y[order[i]] = label_y[order[i-1]] + 14;
+        }
+        for (int i = 0; i < 4; i++) {
+            lv_obj_set_y(temp_ser_labels[i], CHART_Y + label_y[i]);
+        }
+    }
+
+    update_range_visuals();
+}
+
+static void update_range_visuals(void) {
+    if (!range_bg) return;
+    int bw = range_bar_w;
+    // Handle positions
+    int lx = range_bar_x + range_start * bw / (TIMELINE_POINTS - 1);
+    int rx = range_bar_x + range_end * bw / (TIMELINE_POINTS - 1);
+    // Fill bar between handles
+    lv_obj_set_pos(range_fill, lx, RANGE_SLIDER_Y);
+    lv_obj_set_size(range_fill, rx - lx, RANGE_SLIDER_H);
+    // Handles
+    lv_obj_set_pos(range_hl, lx - 4, RANGE_SLIDER_Y - 2);
+    lv_obj_set_pos(range_hr, rx - 4, RANGE_SLIDER_Y - 2);
+    // Time labels: emulated start at 08:00, 1 point = 1 min
+    int t0 = 8 * 60 + range_start; // minutes since midnight
+    int t1 = 8 * 60 + range_end;
+    char buf[8];
+    lv_snprintf(buf, sizeof(buf), "%d:%02d", t0 / 60, t0 % 60);
+    lv_label_set_text(range_ll, buf);
+    int llx = lx - 12;
+    if (llx < 0) llx = 0;
+    lv_obj_set_pos(range_ll, llx, RANGE_SLIDER_Y + RANGE_SLIDER_H + 2);
+    lv_snprintf(buf, sizeof(buf), "%d:%02d", t1 / 60, t1 % 60);
+    lv_label_set_text(range_lr, buf);
+    int lrx = rx - 12;
+    if (lrx > SCREEN_W - 35) lrx = SCREEN_W - 35;
+    lv_obj_set_pos(range_lr, lrx, RANGE_SLIDER_Y + RANGE_SLIDER_H + 2);
+}
+
+// ============================================================================
+// Range slider touch handler (for screen 2 only)
+// ============================================================================
+static void range_touch_cb(lv_event_t *e) {
+    if (current_screen != 1) return; // only on temperatures screen
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev) return;
+    lv_point_t tp;
+    lv_indev_get_point(indev, &tp);
+
+    int sy = CONTENT_TOP + RANGE_SLIDER_Y - 10;
+    int sh = RANGE_SLIDER_H + 20;
+
+    if (code == LV_EVENT_PRESSING) {
+        // Check if touch is in slider area
+        if (tp.y < sy || tp.y > sy + sh) return;
+        int rx = tp.x - range_bar_x;
+        if (rx < -10 || rx > range_bar_w + 10) return;
+
+        int pt = rx * (TIMELINE_POINTS - 1) / range_bar_w;
+        if (pt < 0) pt = 0;
+        if (pt >= TIMELINE_POINTS) pt = TIMELINE_POINTS - 1;
+
+        if (range_drag == 0) {
+            // Determine which handle to grab
+            int dl = abs(pt - range_start);
+            int dr = abs(pt - range_end);
+            range_drag = (dl <= dr) ? 1 : 2;
+        }
+
+        int min_gap = 5; // minimum 5 points between handles
+        if (range_drag == 1) {
+            if (pt > range_end - min_gap) pt = range_end - min_gap;
+            if (pt < 0) pt = 0;
+            range_start = pt;
+        } else {
+            if (pt < range_start + min_gap) pt = range_start + min_gap;
+            if (pt >= TIMELINE_POINTS) pt = TIMELINE_POINTS - 1;
+            range_end = pt;
+        }
+
+        if (lvgl_port_lock(50)) {
+            update_chart_from_range();
+            lvgl_port_unlock();
+        }
+    } else if (code == LV_EVENT_RELEASED) {
+        range_drag = 0;
+    }
+}
+
+// ============================================================================
+// Generic chart builder
+// ============================================================================
 static lv_obj_t *build_chart_generic(
     lv_obj_t *parent,
     const char *title_text,
     int y_min, int y_max,
     const char *y_unit,
     const char **x_labels, int x_count,
-    chart_series_cfg_t *series_cfg, int num_series)
+    chart_series_cfg_t *series_cfg, int num_series,
+    int y2_min, int y2_max, int chart_h,
+    lv_obj_t **label_out)
 {
     (void)title_text;
     (void)y_unit;
+    int has_y2 = (y2_min != y2_max);
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
     // Dynamic Y-axis width based on label content
+    int y_label_count = 9;
+    int y_divs = y_label_count - 1;
     int max_chars = 0;
-    for (int i = 0; i < 5; i++) {
-        int val = y_min + i * (y_max - y_min) / 4;
+    for (int i = 0; i < y_label_count; i++) {
+        int val = y_min + i * (y_max - y_min) / y_divs;
         int nc = (val < 0) ? 1 : 0;
         int av = abs(val);
         do { nc++; av /= 10; } while (av > 0);
         if (nc > max_chars) max_chars = nc;
     }
-    int chart_x = max_chars * 8 + 6;
-    if (chart_x < 22) chart_x = 22;
-    int chart_w = SCREEN_W - chart_x - 2;
+    int chart_x = max_chars * 7 + 3;
+    if (chart_x < 18) chart_x = 18;
+    // Reserve space for right Y axis if needed
+    int right_margin = 2;
+    if (has_y2) {
+        int max_chars_r = 0;
+        for (int i = 0; i < y_label_count; i++) {
+            int val = y2_min + i * (y2_max - y2_min) / y_divs;
+            int nc = (val < 0) ? 1 : 0;
+            int av = abs(val);
+            do { nc++; av /= 10; } while (av > 0);
+            if (nc > max_chars_r) max_chars_r = nc;
+        }
+        right_margin = max_chars_r * 7 + 3;
+        if (right_margin < 18) right_margin = 18;
+    }
+    int chart_w = SCREEN_W - chart_x - right_margin;
 
     lv_obj_t *chart = lv_chart_create(parent);
-    lv_obj_set_size(chart, chart_w, CHART_H);
+    lv_obj_set_size(chart, chart_w, chart_h);
     lv_obj_set_pos(chart, chart_x, CHART_Y);
     lv_obj_set_style_bg_color(chart, lv_color_make(15, 15, 25), 0);
     lv_obj_set_style_border_color(chart, lv_color_make(60, 60, 80), 0);
@@ -485,13 +675,15 @@ static lv_obj_t *build_chart_generic(
 
     lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
     lv_chart_set_point_count(chart, CHART_POINTS);
-    lv_chart_set_div_line_count(chart, 5, x_count);
+    lv_chart_set_div_line_count(chart, y_label_count, x_count);
     lv_chart_set_axis_range(chart, LV_CHART_AXIS_PRIMARY_Y, y_min, y_max);
+    if (has_y2)
+        lv_chart_set_axis_range(chart, LV_CHART_AXIS_SECONDARY_Y, y2_min, y2_max);
 
     lv_obj_set_style_line_width(chart, 2, LV_PART_ITEMS);
     lv_obj_set_style_size(chart, 4, 4, LV_PART_INDICATOR);
 
-    int content_h = CHART_H - 2 * CHART_PAD;
+    int content_h = chart_h - 2 * CHART_PAD;
 
     // Compute label y-positions based on last data values, then de-overlap
     int label_y[8];
@@ -499,7 +691,7 @@ static lv_obj_t *build_chart_generic(
         int32_t last_val = series_cfg[i].data[CHART_POINTS - 1];
         label_y[i] = CHART_PAD + content_h - ((last_val - y_min) * content_h / (y_max - y_min)) - 14;
         if (label_y[i] < 0) label_y[i] = 0;
-        if (label_y[i] > CHART_H - 14) label_y[i] = CHART_H - 14;
+        if (label_y[i] > chart_h - 14) label_y[i] = chart_h - 14;
     }
     int order[8];
     for (int i = 0; i < num_series; i++) order[i] = i;
@@ -515,7 +707,7 @@ static lv_obj_t *build_chart_generic(
 
     // Add series and inline labels on right side of chart
     for (int i = 0; i < num_series; i++) {
-        *series_cfg[i].series_ptr = lv_chart_add_series(chart, series_cfg[i].color, LV_CHART_AXIS_PRIMARY_Y);
+        *series_cfg[i].series_ptr = lv_chart_add_series(chart, series_cfg[i].color, series_cfg[i].axis);
         lv_chart_set_series_ext_y_array(chart, *series_cfg[i].series_ptr, series_cfg[i].data);
 
         lv_obj_t *lbl = lv_label_create(parent);
@@ -525,13 +717,14 @@ static lv_obj_t *build_chart_generic(
         lv_obj_set_style_bg_color(lbl, lv_color_make(15, 15, 25), 0);
         lv_obj_set_style_bg_opa(lbl, LV_OPA_70, 0);
         lv_obj_set_pos(lbl, chart_x + chart_w - CHART_PAD - 55, CHART_Y + label_y[i]);
+        if (label_out) label_out[i] = lbl;
     }
 
-    // Y axis labels (5 evenly distributed, right-aligned)
+    // Left Y axis labels
     {
         char vbuf[16];
-        for (int i = 0; i < 5; i++) {
-            int val = y_min + i * (y_max - y_min) / 4;
+        for (int i = 0; i < y_label_count; i++) {
+            int val = y_min + i * (y_max - y_min) / y_divs;
             lv_snprintf(vbuf, sizeof(vbuf), "%d", val);
             lv_obj_t *yl = lv_label_create(parent);
             lv_label_set_text(yl, vbuf);
@@ -539,9 +732,23 @@ static lv_obj_t *build_chart_generic(
             lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
             lv_obj_set_width(yl, chart_x - 2);
             lv_obj_set_style_text_align(yl, LV_TEXT_ALIGN_RIGHT, 0);
-            int y_pix = CHART_Y + CHART_PAD + content_h - (i * content_h / 4) - 6;
+            int y_pix = CHART_Y + CHART_PAD + content_h - (i * content_h / y_divs) - 6;
             if (y_pix < 0) y_pix = 0;
             lv_obj_set_pos(yl, 0, y_pix);
+        }
+    }
+
+    // Right Y2 axis labels (if dual axis)
+    if (has_y2) {
+        char vbuf[16];
+        for (int i = 0; i < y_label_count; i++) {
+            int val = y2_min + i * (y2_max - y2_min) / y_divs;
+            lv_snprintf(vbuf, sizeof(vbuf), "%d", val);
+            lv_obj_t *yl = lv_label_create(parent);
+            lv_label_set_text(yl, vbuf);
+            lv_obj_set_style_text_color(yl, lv_color_make(100, 100, 120), 0);
+            lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
+            lv_obj_set_pos(yl, chart_x + chart_w + 2, CHART_Y + CHART_PAD + content_h - (i * content_h / y_divs) - 6);
         }
     }
 
@@ -556,7 +763,7 @@ static lv_obj_t *build_chart_generic(
             int xp = chart_x + CHART_PAD + (i * content_w / (x_count - 1)) - 15;
             if (xp < 0) xp = 0;
             if (xp > SCREEN_W - 35) xp = SCREEN_W - 35;
-            lv_obj_set_pos(lbl, xp, CHART_Y + CHART_H + 2);
+            lv_obj_set_pos(lbl, xp, CHART_Y + chart_h + 2);
         }
     }
 
@@ -568,10 +775,15 @@ static lv_obj_t *build_chart_generic(
         ci->y_min = y_min; ci->y_max = y_max;
         ci->x_labels = x_labels; ci->x_count = x_count;
         ci->num_series = num_series;
-        ci->chart_x = chart_x; ci->chart_w = chart_w;
+        ci->chart_x = chart_x; ci->chart_w = chart_w; ci->chart_h = chart_h;
         for (int i = 0; i < num_series && i < 8; i++) {
             ci->data[i] = series_cfg[i].data;
             ci->colors[i] = series_cfg[i].color;
+            if (series_cfg[i].axis == LV_CHART_AXIS_SECONDARY_Y && has_y2) {
+                ci->s_y_min[i] = y2_min; ci->s_y_max[i] = y2_max;
+            } else {
+                ci->s_y_min[i] = y_min; ci->s_y_max[i] = y_max;
+            }
         }
     }
 
@@ -594,8 +806,8 @@ static void build_nav_bar(lv_obj_t *scr) {
     lv_obj_clear_flag(nav_bar, LV_OBJ_FLAG_SCROLLABLE);
 
     btn_prev = lv_button_create(nav_bar);
-    lv_obj_set_size(btn_prev, 60, 34);
-    lv_obj_set_pos(btn_prev, 5, 3);
+    lv_obj_set_size(btn_prev, 52, 32);
+    lv_obj_set_pos(btn_prev, 5, 4);
     lv_obj_set_style_bg_color(btn_prev, lv_color_make(60, 60, 80), 0);
     lv_obj_set_style_radius(btn_prev, 6, 0);
     lv_obj_add_event_cb(btn_prev, btn_prev_cb, LV_EVENT_CLICKED, NULL);
@@ -605,8 +817,8 @@ static void build_nav_bar(lv_obj_t *scr) {
     lv_obj_center(pl);
 
     btn_next = lv_button_create(nav_bar);
-    lv_obj_set_size(btn_next, 60, 34);
-    lv_obj_set_pos(btn_next, SCREEN_W - 65, 3);
+    lv_obj_set_size(btn_next, 52, 32);
+    lv_obj_set_pos(btn_next, SCREEN_W - 57, 4);
     lv_obj_set_style_bg_color(btn_next, lv_color_make(60, 60, 80), 0);
     lv_obj_set_style_radius(btn_next, 6, 0);
     lv_obj_add_event_cb(btn_next, btn_next_cb, LV_EVENT_CLICKED, NULL);
@@ -639,7 +851,7 @@ static void build_nav_bar(lv_obj_t *scr) {
 // Build all screens
 // ============================================================================
 static void build_dashboard(void) {
-    static const char *x_times[] = {"12:00", "12:30", "13:00", "13:30", "14:00", "14:30"};
+    static const char *x_times[] = {"12:00", "12:15", "12:30", "12:45", "13:00", "13:15", "13:30", "13:45", "14:00", "14:15", "14:30"};
 
     // Phase 1: Create base layout + status bar + containers
     if (lvgl_port_lock(100)) {
@@ -688,14 +900,76 @@ static void build_dashboard(void) {
     // Phase 3: Temperatures chart
     if (lvgl_port_lock(100)) {
         chart_series_cfg_t temp_series[] = {
-            {"Oil",     lv_palette_main(LV_PALETTE_RED),    data_oil,     &ser_oil},
-            {"Coolant", lv_palette_main(LV_PALETTE_GREEN),  data_coolant, &ser_coolant},
-            {"Trans",   lv_palette_main(LV_PALETTE_ORANGE), data_trans,   &ser_trans},
-            {"Ambient", lv_palette_main(LV_PALETTE_BLUE),   data_ambient, &ser_ambient},
+            {"Oil",     lv_palette_main(LV_PALETTE_RED),    disp_oil,     &ser_oil,     LV_CHART_AXIS_PRIMARY_Y},
+            {"Coolant", lv_palette_main(LV_PALETTE_GREEN),  disp_coolant, &ser_coolant, LV_CHART_AXIS_PRIMARY_Y},
+            {"Trans",   lv_palette_main(LV_PALETTE_ORANGE), disp_trans,   &ser_trans,   LV_CHART_AXIS_PRIMARY_Y},
+            {"Ambient", lv_palette_main(LV_PALETTE_BLUE),   disp_ambient, &ser_ambient, LV_CHART_AXIS_PRIMARY_Y},
         };
         chart_temp = build_chart_generic(screens[1],
             "Temperatures (emulated)", -10, 120, "C",
-            x_times, 6, temp_series, 4);
+            x_times, 11, temp_series, 4, 0, 0, RANGE_CHART_H, temp_ser_labels);
+
+        // Range slider on temperatures screen
+        // Make bar symmetric: right margin from screen edge, mirror to left
+        {
+            int chart_right = chart_infos[0].chart_x + chart_infos[0].chart_w;
+            int right_gap = SCREEN_W - chart_right + CHART_PAD;
+            range_bar_x = right_gap;
+            range_bar_w = SCREEN_W - 2 * right_gap;
+        }
+
+        // Background bar (dark)
+        range_bg = lv_obj_create(screens[1]);
+        lv_obj_set_size(range_bg, range_bar_w, RANGE_SLIDER_H);
+        lv_obj_set_pos(range_bg, range_bar_x, RANGE_SLIDER_Y);
+        lv_obj_set_style_bg_color(range_bg, lv_color_make(40, 40, 55), 0);
+        lv_obj_set_style_bg_opa(range_bg, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(range_bg, 1, 0);
+        lv_obj_set_style_border_color(range_bg, lv_color_make(60, 60, 80), 0);
+        lv_obj_set_style_radius(range_bg, 3, 0);
+        lv_obj_set_style_pad_all(range_bg, 0, 0);
+        lv_obj_clear_flag(range_bg, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        // Fill bar (selected range)
+        range_fill = lv_obj_create(screens[1]);
+        lv_obj_set_style_bg_color(range_fill, lv_palette_main(LV_PALETTE_CYAN), 0);
+        lv_obj_set_style_bg_opa(range_fill, LV_OPA_60, 0);
+        lv_obj_set_style_border_width(range_fill, 0, 0);
+        lv_obj_set_style_radius(range_fill, 3, 0);
+        lv_obj_set_style_pad_all(range_fill, 0, 0);
+        lv_obj_clear_flag(range_fill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        // Left handle
+        range_hl = lv_obj_create(screens[1]);
+        lv_obj_set_size(range_hl, 8, RANGE_SLIDER_H + 4);
+        lv_obj_set_style_bg_color(range_hl, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(range_hl, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(range_hl, 0, 0);
+        lv_obj_set_style_radius(range_hl, 2, 0);
+        lv_obj_clear_flag(range_hl, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        // Right handle
+        range_hr = lv_obj_create(screens[1]);
+        lv_obj_set_size(range_hr, 8, RANGE_SLIDER_H + 4);
+        lv_obj_set_style_bg_color(range_hr, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(range_hr, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(range_hr, 0, 0);
+        lv_obj_set_style_radius(range_hr, 2, 0);
+        lv_obj_clear_flag(range_hr, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        // Left time label
+        range_ll = lv_label_create(screens[1]);
+        lv_obj_set_style_text_color(range_ll, lv_color_make(180, 180, 200), 0);
+        lv_obj_set_style_text_font(range_ll, &lv_font_montserrat_12, 0);
+        lv_label_set_text(range_ll, "8:00");
+
+        // Right time label
+        range_lr = lv_label_create(screens[1]);
+        lv_obj_set_style_text_color(range_lr, lv_color_make(180, 180, 200), 0);
+        lv_obj_set_style_text_font(range_lr, &lv_font_montserrat_12, 0);
+        lv_label_set_text(range_lr, "10:00");
+
+        update_range_visuals();
         lvgl_port_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -703,14 +977,13 @@ static void build_dashboard(void) {
     // Phase 4: Speed/RPM chart
     if (lvgl_port_lock(100)) {
         chart_series_cfg_t speed_series[] = {
-            {"RPM",     lv_palette_main(LV_PALETTE_RED),   data_rpm,     &ser_rpm},
-            {"Turbine", lv_palette_main(LV_PALETTE_AMBER), data_turbine, &ser_turbine},
-            {"km/h",    lv_palette_main(LV_PALETTE_GREEN), data_vspeed,  &ser_veh_speed},
+            {"RPM",     lv_palette_main(LV_PALETTE_RED),   data_rpm,     &ser_rpm,      LV_CHART_AXIS_PRIMARY_Y},
+            {"Turbine", lv_palette_main(LV_PALETTE_AMBER), data_turbine, &ser_turbine,  LV_CHART_AXIS_PRIMARY_Y},
+            {"km/h",    lv_palette_main(LV_PALETTE_GREEN), data_vspeed,  &ser_veh_speed, LV_CHART_AXIS_SECONDARY_Y},
         };
         chart_speed = build_chart_generic(screens[2],
             "Speed / RPM (emulated)", 0, 4500, "RPM",
-            x_times, 6, speed_series, 3);
-        lv_chart_set_axis_range(chart_speed, LV_CHART_AXIS_SECONDARY_Y, 0, 200);
+            x_times, 11, speed_series, 3, 0, 200, CHART_H, NULL);
         lvgl_port_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -718,12 +991,12 @@ static void build_dashboard(void) {
     // Phase 5: Dynamics chart
     if (lvgl_port_lock(100)) {
         chart_series_cfg_t dyn_series[] = {
-            {"Lat G",  lv_palette_main(LV_PALETTE_RED),   data_lat_g, &ser_lat_g},
-            {"Yaw",    lv_palette_main(LV_PALETTE_CYAN),  data_yaw,   &ser_yaw},
+            {"Lat G",  lv_palette_main(LV_PALETTE_RED),   data_lat_g, &ser_lat_g, LV_CHART_AXIS_PRIMARY_Y},
+            {"Yaw",    lv_palette_main(LV_PALETTE_CYAN),  data_yaw,   &ser_yaw,   LV_CHART_AXIS_PRIMARY_Y},
         };
         chart_dyn = build_chart_generic(screens[3],
             "Dynamics (emulated)", -80, 80, "",
-            x_times, 6, dyn_series, 2);
+            x_times, 11, dyn_series, 2, 0, 0, CHART_H, NULL);
         lvgl_port_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -731,14 +1004,14 @@ static void build_dashboard(void) {
     // Phase 6: Suspension chart
     if (lvgl_port_lock(100)) {
         chart_series_cfg_t susp_series[] = {
-            {"FL", lv_palette_main(LV_PALETTE_RED),    data_lev_fl, &ser_lev_fl},
-            {"FR", lv_palette_main(LV_PALETTE_GREEN),  data_lev_fr, &ser_lev_fr},
-            {"RL", lv_palette_main(LV_PALETTE_BLUE),   data_lev_rl, &ser_lev_rl},
-            {"RR", lv_palette_main(LV_PALETTE_ORANGE), data_lev_rr, &ser_lev_rr},
+            {"FL", lv_palette_main(LV_PALETTE_RED),    data_lev_fl, &ser_lev_fl, LV_CHART_AXIS_PRIMARY_Y},
+            {"FR", lv_palette_main(LV_PALETTE_GREEN),  data_lev_fr, &ser_lev_fr, LV_CHART_AXIS_PRIMARY_Y},
+            {"RL", lv_palette_main(LV_PALETTE_BLUE),   data_lev_rl, &ser_lev_rl, LV_CHART_AXIS_PRIMARY_Y},
+            {"RR", lv_palette_main(LV_PALETTE_ORANGE), data_lev_rr, &ser_lev_rr, LV_CHART_AXIS_PRIMARY_Y},
         };
         chart_susp = build_chart_generic(screens[4],
             "AIRMATIC Levels (emulated)", 110, 145, "",
-            x_times, 6, susp_series, 4);
+            x_times, 11, susp_series, 4, 0, 0, CHART_H, NULL);
         lvgl_port_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -784,6 +1057,9 @@ static void build_dashboard(void) {
             lv_obj_add_event_cb(screens[i], chart_screen_touch_cb, LV_EVENT_PRESSING, NULL);
             lv_obj_add_event_cb(screens[i], chart_screen_touch_cb, LV_EVENT_RELEASED, NULL);
         }
+        // Range slider touch on temperatures screen
+        lv_obj_add_event_cb(screens[1], range_touch_cb, LV_EVENT_PRESSING, NULL);
+        lv_obj_add_event_cb(screens[1], range_touch_cb, LV_EVENT_RELEASED, NULL);
 
         lvgl_port_unlock();
     }
@@ -1146,6 +1422,12 @@ void app_main(void) {
         }
     }
 
+    generate_timeline_data();
+    // Pre-fill display buffers so chart labels position correctly
+    downsample_range(tl_oil, disp_oil, range_start, range_end);
+    downsample_range(tl_coolant, disp_coolant, range_start, range_end);
+    downsample_range(tl_trans, disp_trans, range_start, range_end);
+    downsample_range(tl_ambient, disp_ambient, range_start, range_end);
     build_dashboard();
     if (lvgl_port_lock(1000)) {
         lv_timer_create(dashboard_timer_cb, 200, NULL);
