@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_lcd_panel_io.h"
@@ -21,7 +22,10 @@
 #include "mercedes_decode.h"
 #include "vehicle_data.h"
 #include "obd2_pids.h"
+#include "sd_logger.h"
 #include <inttypes.h>
+#include <time.h>
+#include <sys/time.h>
 
 static const char *TAG = "CYD_35";
 
@@ -46,13 +50,15 @@ static const char *TAG = "CYD_35";
 #define CONTENT_TOP 18
 #define CONTENT_H (SCREEN_H - 40 - CONTENT_TOP)
 
-// 5 screens: Params, Temps chart, Speeds chart, Dynamics chart, Suspension chart
-#define NUM_SCREENS 5
+// 6 screens: Params, Log Files, Temps chart, Speeds chart, Dynamics chart, Suspension chart
+#define NUM_SCREENS 6
 static int current_screen = 0;
 static lv_obj_t *screens[NUM_SCREENS];
+static bool screen_built[NUM_SCREENS] = {false};
 
 // Pinned CAN status bar label
 static lv_obj_t *status_bar_label = NULL;
+static lv_obj_t *status_time_label = NULL;
 
 // ============================================================================
 // Screen 1: Parameters list
@@ -141,6 +147,38 @@ static lv_obj_t *range_hl = NULL, *range_hr = NULL;
 static lv_obj_t *range_ll = NULL, *range_lr = NULL;
 static int range_bar_x = 0, range_bar_w = 0; // set during build
 static lv_obj_t *temp_ser_labels[4] = {NULL}; // series name labels (repositioned on range change)
+
+// Temperature chart Y-axis labels (for dynamic rescaling)
+#define MAX_Y_LABELS 12
+static lv_obj_t *temp_y_labels[MAX_Y_LABELS] = {NULL};
+static int temp_y_label_count = 0;
+static int temp_chart_x = 0; // stored for label positioning
+
+// Log file selector row Y position
+#define LOG_ROW_Y (RANGE_SLIDER_Y + RANGE_SLIDER_H + 20)
+
+// ============================================================================
+// Emulated log files
+// ============================================================================
+#define NUM_LOG_FILES 3
+
+typedef struct {
+    const char *name;
+    int start_hour, start_min;
+} log_file_meta_t;
+
+static const log_file_meta_t log_files[NUM_LOG_FILES] = {
+    { "2026-03-08_0800.log", 8, 0 },
+    { "2026-03-07_1430.log", 14, 30 },
+    { "2026-03-06_0615.log", 6, 15 },
+};
+static int current_log = 0;
+static lv_obj_t *log_name_label = NULL;
+
+// Screen 1: Log file selector
+#define LOG_LIST_MAX 10
+static lv_obj_t *log_list_btns[LOG_LIST_MAX] = {NULL};
+static lv_obj_t *log_list_labels[LOG_LIST_MAX] = {NULL};
 
 // Screen 3: Speeds/RPM
 static lv_obj_t *chart_speed = NULL;
@@ -233,7 +271,7 @@ void blink_task(void *arg) {
 // Navigation
 // ============================================================================
 static const char *screen_titles[] = {
-    "PARAMETERS", "TEMPERATURES", "SPEED / RPM", "DYNAMICS", "SUSPENSION"
+    "PARAMETERS", "LOG FILES", "TEMPERATURES", "SPEED / RPM", "DYNAMICS", "SUSPENSION"
 };
 
 static void update_nav_ui(void) {
@@ -249,12 +287,18 @@ static void update_nav_ui(void) {
 }
 
 static void cross_hide_now(void);  // forward decl
+static void build_screen_content(int idx);  // forward decl — lazy screen builder
 
 static void switch_screen(int new_screen) {
     if (new_screen < 0) new_screen = NUM_SCREENS - 1;
     if (new_screen >= NUM_SCREENS) new_screen = 0;
     if (new_screen == current_screen) return;
     cross_hide_now();
+    // Lazy build: construct screen content on first visit
+    if (!screen_built[new_screen]) {
+        build_screen_content(new_screen);
+        screen_built[new_screen] = true;
+    }
     lv_obj_add_flag(screens[current_screen], LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(screens[new_screen], LV_OBJ_FLAG_HIDDEN);
     current_screen = new_screen;
@@ -371,8 +415,8 @@ static void cross_hide_now(void) {
 }
 
 static void chart_screen_touch_cb(lv_event_t *e) {
-    if (current_screen < 1 || current_screen > 4) return;
-    chart_info_t *info = &chart_infos[current_screen - 1];
+    if (current_screen < 2 || current_screen > 5) return;
+    chart_info_t *info = &chart_infos[current_screen - 2];
     if (info->num_series == 0) return;
     lv_event_code_t code = lv_event_get_code(e);
 
@@ -434,10 +478,11 @@ static void chart_screen_touch_cb(lv_event_t *e) {
         char xbuf[8];
         {
             int t0m, t1m;
-            if (current_screen == 1) {
-                // Use range slider time (emulated: 08:00 + range_start..range_end minutes)
-                t0m = 8 * 60 + range_start;
-                t1m = 8 * 60 + range_end;
+            if (current_screen == 2) {
+                // Use range slider time from current log file
+                int base = log_files[current_log].start_hour * 60 + log_files[current_log].start_min;
+                t0m = base + range_start;
+                t1m = base + range_end;
             } else {
                 int sh = 0, sm = 0, eh = 0, em = 0;
                 sscanf(info->x_labels[0], "%d:%d", &sh, &sm);
@@ -466,18 +511,40 @@ static void chart_screen_touch_cb(lv_event_t *e) {
 // ============================================================================
 // Timeline data generation & downsampling
 // ============================================================================
-static void generate_timeline_data(void) {
+// Generate emulated log data directly into tl_ arrays for given file index
+static void generate_log_data(int idx) {
     for (int i = 0; i < TIMELINE_POINTS; i++) {
-        // Simulate engine warmup then cruising with variations
-        int phase = i < 30 ? i : 30; // warmup in first 30 min
-        tl_oil[i] = 20 + phase * 2 + (i > 30 ? 25 + ((i * 7 + 13) % 11) - 5 : 0);
-        tl_coolant[i] = 20 + phase * 2 + (i > 30 ? 18 + ((i * 11 + 7) % 7) - 3 : 0);
-        tl_trans[i] = 18 + (phase * 18) / 10 + (i > 30 ? 20 + ((i * 13 + 5) % 9) - 4 : 0);
-        tl_ambient[i] = 15 + ((i * 3 + 17) % 11) - 3;
-        // Clamp
-        if (tl_oil[i] > 115) tl_oil[i] = 115;
-        if (tl_coolant[i] > 95) tl_coolant[i] = 95;
-        if (tl_trans[i] > 90) tl_trans[i] = 90;
+        if (idx == 0) {
+            // Morning city drive — warmup then cruising
+            int phase = i < 30 ? i : 30;
+            tl_oil[i] = 20 + phase * 2 + (i > 30 ? 25 + ((i * 7 + 13) % 11) - 5 : 0);
+            tl_coolant[i] = 20 + phase * 2 + (i > 30 ? 18 + ((i * 11 + 7) % 7) - 3 : 0);
+            tl_trans[i] = 18 + (phase * 18) / 10 + (i > 30 ? 20 + ((i * 13 + 5) % 9) - 4 : 0);
+            tl_ambient[i] = 15 + ((i * 3 + 17) % 11) - 3;
+            if (tl_oil[i] > 115) tl_oil[i] = 115;
+            if (tl_coolant[i] > 95) tl_coolant[i] = 95;
+            if (tl_trans[i] > 90) tl_trans[i] = 90;
+        } else if (idx == 1) {
+            // Afternoon highway — fast warmup, higher temps
+            int phase = i < 15 ? i * 2 : 30;
+            tl_oil[i] = 25 + phase * 2 + (i > 15 ? 30 + ((i * 11 + 3) % 13) - 6 : 0);
+            tl_coolant[i] = 22 + phase * 2 + (i > 15 ? 20 + ((i * 7 + 11) % 9) - 4 : 0);
+            tl_trans[i] = 20 + (phase * 20) / 10 + (i > 15 ? 25 + ((i * 17 + 3) % 11) - 5 : 0);
+            tl_ambient[i] = 22 + ((i * 5 + 7) % 9) - 4;
+            if (tl_oil[i] > 118) tl_oil[i] = 118;
+            if (tl_coolant[i] > 98) tl_coolant[i] = 98;
+            if (tl_trans[i] > 95) tl_trans[i] = 95;
+        } else {
+            // Cold morning start — slow warmup, low ambient
+            int phase = i < 45 ? i : 45;
+            tl_oil[i] = -5 + (phase * 22) / 10 + (i > 45 ? 20 + ((i * 9 + 7) % 13) - 6 : 0);
+            tl_coolant[i] = -3 + (phase * 20) / 10 + (i > 45 ? 15 + ((i * 13 + 3) % 11) - 5 : 0);
+            tl_trans[i] = -8 + (phase * 18) / 10 + (i > 45 ? 18 + ((i * 11 + 9) % 7) - 3 : 0);
+            tl_ambient[i] = -5 + ((i * 2 + 11) % 7) - 2;
+            if (tl_oil[i] > 105) tl_oil[i] = 105;
+            if (tl_coolant[i] > 90) tl_coolant[i] = 90;
+            if (tl_trans[i] > 80) tl_trans[i] = 80;
+        }
     }
 }
 
@@ -497,19 +564,63 @@ static void downsample_range(int32_t *src, int32_t *dst, int start, int end) {
 }
 
 static void update_range_visuals(void);
+static int nice_step(int range);
+static void auto_scale_axis(int data_min, int data_max, int *out_min, int *out_max, int *out_step);
 
-static void update_chart_from_range(void) {
-    downsample_range(tl_oil, disp_oil, range_start, range_end);
-    downsample_range(tl_coolant, disp_coolant, range_start, range_end);
-    downsample_range(tl_trans, disp_trans, range_start, range_end);
-    downsample_range(tl_ambient, disp_ambient, range_start, range_end);
-    if (chart_temp) lv_chart_refresh(chart_temp);
+static void rescale_temp_chart(void) {
+    if (!chart_temp) return;
+    int32_t *bufs[4] = {disp_oil, disp_coolant, disp_trans, disp_ambient};
+
+    // Find data min/max across all 4 series
+    int dmin = INT32_MAX, dmax = INT32_MIN;
+    for (int s = 0; s < 4; s++) {
+        for (int p = 0; p < CHART_POINTS; p++) {
+            if (bufs[s][p] < dmin) dmin = bufs[s][p];
+            if (bufs[s][p] > dmax) dmax = bufs[s][p];
+        }
+    }
+    if (dmin == INT32_MAX) return;
+
+    int y_min, y_max, y_step;
+    auto_scale_axis(dmin, dmax, &y_min, &y_max, &y_step);
+    int y_lc = (y_max - y_min) / y_step + 1;
+    if (y_lc < 3) y_lc = 3;
+    if (y_lc > MAX_Y_LABELS) y_lc = MAX_Y_LABELS;
+
+    // Update chart axis range
+    lv_chart_set_axis_range(chart_temp, LV_CHART_AXIS_PRIMARY_Y, y_min, y_max);
+    lv_chart_set_div_line_count(chart_temp, y_lc, 11);
+
+    // Update stored info for crosshair
+    chart_infos[0].y_min = y_min;
+    chart_infos[0].y_max = y_max;
+    for (int s = 0; s < chart_infos[0].num_series; s++) {
+        chart_infos[0].s_y_min[s] = y_min;
+        chart_infos[0].s_y_max[s] = y_max;
+    }
+
+    // Update Y-axis labels
+    int content_h = RANGE_CHART_H - 2 * CHART_PAD;
+    int y_divs = y_lc - 1;
+    for (int i = 0; i < MAX_Y_LABELS; i++) {
+        if (!temp_y_labels[i]) continue;
+        if (i < y_lc) {
+            int val = y_min + i * (y_max - y_min) / y_divs;
+            char vbuf[16];
+            lv_snprintf(vbuf, sizeof(vbuf), "%d", val);
+            lv_label_set_text(temp_y_labels[i], vbuf);
+            int y_pix = CHART_Y + CHART_PAD + content_h - (i * content_h / y_divs) - 6;
+            if (y_pix < 0) y_pix = 0;
+            lv_obj_set_pos(temp_y_labels[i], 0, y_pix);
+            lv_obj_clear_flag(temp_y_labels[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(temp_y_labels[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    temp_y_label_count = y_lc;
 
     // Reposition series labels to follow last data point
     if (temp_ser_labels[0]) {
-        int32_t *bufs[4] = {disp_oil, disp_coolant, disp_trans, disp_ambient};
-        int content_h = RANGE_CHART_H - 2 * CHART_PAD;
-        int y_min = -10, y_max = 120;
         int label_y[4];
         for (int i = 0; i < 4; i++) {
             int32_t last_val = bufs[i][CHART_POINTS - 1];
@@ -517,7 +628,6 @@ static void update_chart_from_range(void) {
             if (label_y[i] < 0) label_y[i] = 0;
             if (label_y[i] > RANGE_CHART_H - 14) label_y[i] = RANGE_CHART_H - 14;
         }
-        // Sort and de-overlap
         int order[4] = {0, 1, 2, 3};
         for (int i = 0; i < 3; i++)
             for (int j = i + 1; j < 4; j++)
@@ -532,7 +642,17 @@ static void update_chart_from_range(void) {
             lv_obj_set_y(temp_ser_labels[i], CHART_Y + label_y[i]);
         }
     }
+}
 
+static void update_chart_from_range(void) {
+    downsample_range(tl_oil, disp_oil, range_start, range_end);
+    downsample_range(tl_coolant, disp_coolant, range_start, range_end);
+    downsample_range(tl_trans, disp_trans, range_start, range_end);
+    downsample_range(tl_ambient, disp_ambient, range_start, range_end);
+    if (chart_temp) {
+        rescale_temp_chart();
+        lv_chart_refresh(chart_temp);
+    }
     update_range_visuals();
 }
 
@@ -548,9 +668,10 @@ static void update_range_visuals(void) {
     // Handles
     lv_obj_set_pos(range_hl, lx - 4, RANGE_SLIDER_Y - 2);
     lv_obj_set_pos(range_hr, rx - 4, RANGE_SLIDER_Y - 2);
-    // Time labels: emulated start at 08:00, 1 point = 1 min
-    int t0 = 8 * 60 + range_start; // minutes since midnight
-    int t1 = 8 * 60 + range_end;
+    // Time labels: use log file start time, 1 point = 1 min
+    int base = log_files[current_log].start_hour * 60 + log_files[current_log].start_min;
+    int t0 = base + range_start;
+    int t1 = base + range_end;
     char buf[8];
     lv_snprintf(buf, sizeof(buf), "%d:%02d", t0 / 60, t0 % 60);
     lv_label_set_text(range_ll, buf);
@@ -568,7 +689,7 @@ static void update_range_visuals(void) {
 // Range slider touch handler (for screen 2 only)
 // ============================================================================
 static void range_touch_cb(lv_event_t *e) {
-    if (current_screen != 1) return; // only on temperatures screen
+    if (current_screen != 2) return; // only on temperatures screen
     lv_event_code_t code = lv_event_get_code(e);
     lv_indev_t *indev = lv_indev_active();
     if (!indev) return;
@@ -616,6 +737,71 @@ static void range_touch_cb(lv_event_t *e) {
 }
 
 // ============================================================================
+// Log file loading & switching
+// ============================================================================
+static void load_log_file(int idx) {
+    if (idx < 0 || idx >= NUM_LOG_FILES) return;
+    current_log = idx;
+    generate_log_data(idx);
+    range_start = 0;
+    range_end = TIMELINE_POINTS - 1;
+    update_chart_from_range();
+    if (log_name_label)
+        lv_label_set_text(log_name_label, log_files[idx].name);
+}
+
+static void log_list_select_cb(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    load_log_file(idx);
+    // Update selected highlight on log list
+    for (int i = 0; i < NUM_LOG_FILES; i++) {
+        if (log_list_btns[i]) {
+            lv_obj_set_style_bg_color(log_list_btns[i],
+                i == idx ? lv_color_make(30, 60, 90) : lv_color_make(35, 35, 50), 0);
+            lv_obj_set_style_border_color(log_list_btns[i],
+                i == idx ? lv_palette_main(LV_PALETTE_CYAN) : lv_color_make(60, 60, 80), 0);
+        }
+    }
+    // Switch to temperatures screen
+    switch_screen(2);
+}
+
+// ============================================================================
+// Nice Y-axis rounding: find tick step that gives ~5-9 labels
+// ============================================================================
+static int nice_step(int range) {
+    if (range <= 0) range = 1;
+    // Find magnitude
+    int mag = 1;
+    while (mag * 10 <= range) mag *= 10;
+    // Try steps: 1, 2, 5 × magnitude (and 0.1× magnitude)
+    int steps[] = {mag / 10, mag / 5, mag / 2, mag, mag * 2, mag * 5};
+    for (int i = 0; i < 6; i++) {
+        if (steps[i] <= 0) continue;
+        int n = range / steps[i];
+        if (n >= 4 && n <= 11) return steps[i];
+    }
+    return mag;
+}
+
+static void auto_scale_axis(int data_min, int data_max, int *out_min, int *out_max, int *out_step) {
+    int range = data_max - data_min;
+    if (range < 1) range = 1;
+    int step = nice_step(range);
+    // Round min DOWN to nearest step, max UP to nearest step — tight fit
+    if (data_min >= 0)
+        *out_min = (data_min / step) * step;
+    else
+        *out_min = ((data_min - step + 1) / step) * step;
+    if (data_max >= 0)
+        *out_max = ((data_max + step - 1) / step) * step;
+    else
+        *out_max = (data_max / step) * step;
+    if (*out_max <= data_max) *out_max += step;
+    *out_step = step;
+}
+
+// ============================================================================
 // Generic chart builder
 // ============================================================================
 static lv_obj_t *build_chart_generic(
@@ -626,15 +812,53 @@ static lv_obj_t *build_chart_generic(
     const char **x_labels, int x_count,
     chart_series_cfg_t *series_cfg, int num_series,
     int y2_min, int y2_max, int chart_h,
-    lv_obj_t **label_out)
+    lv_obj_t **label_out,
+    lv_obj_t **y_label_out, int *y_label_count_out)
 {
     (void)title_text;
     (void)y_unit;
     int has_y2 = (y2_min != y2_max);
     lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Dynamic Y-axis width based on label content
-    int y_label_count = 9;
+    // Auto-scale primary Y from data
+    {
+        int dmin = INT32_MAX, dmax = INT32_MIN;
+        for (int s = 0; s < num_series; s++) {
+            if (series_cfg[s].axis != LV_CHART_AXIS_PRIMARY_Y) continue;
+            for (int p = 0; p < CHART_POINTS; p++) {
+                if (series_cfg[s].data[p] < dmin) dmin = series_cfg[s].data[p];
+                if (series_cfg[s].data[p] > dmax) dmax = series_cfg[s].data[p];
+            }
+        }
+        if (dmin == INT32_MAX) { dmin = y_min; dmax = y_max; }
+        int step;
+        auto_scale_axis(dmin, dmax, &y_min, &y_max, &step);
+    }
+
+    // Auto-scale secondary Y from data
+    if (has_y2) {
+        int dmin = INT32_MAX, dmax = INT32_MIN;
+        for (int s = 0; s < num_series; s++) {
+            if (series_cfg[s].axis != LV_CHART_AXIS_SECONDARY_Y) continue;
+            for (int p = 0; p < CHART_POINTS; p++) {
+                if (series_cfg[s].data[p] < dmin) dmin = series_cfg[s].data[p];
+                if (series_cfg[s].data[p] > dmax) dmax = series_cfg[s].data[p];
+            }
+        }
+        if (dmin != INT32_MAX) {
+            int step;
+            auto_scale_axis(dmin, dmax, &y2_min, &y2_max, &step);
+        }
+    }
+
+    // Compute Y label count from step size
+    int y_step;
+    { int dummy1, dummy2; auto_scale_axis(y_min, y_max, &dummy1, &dummy2, &y_step); }
+    // Use the range we already have
+    y_step = nice_step(y_max - y_min);
+    int y_label_count = (y_max - y_min) / y_step + 1;
+    if (y_label_count < 3) y_label_count = 3;
+    if (y_label_count > 12) y_label_count = 12;
     int y_divs = y_label_count - 1;
     int max_chars = 0;
     for (int i = 0; i < y_label_count; i++) {
@@ -644,8 +868,8 @@ static lv_obj_t *build_chart_generic(
         do { nc++; av /= 10; } while (av > 0);
         if (nc > max_chars) max_chars = nc;
     }
-    int chart_x = max_chars * 7 + 3;
-    if (chart_x < 18) chart_x = 18;
+    int chart_x = max_chars * 8 + 4;
+    if (chart_x < 20) chart_x = 20;
     // Reserve space for right Y axis if needed
     int right_margin = 2;
     if (has_y2) {
@@ -657,8 +881,8 @@ static lv_obj_t *build_chart_generic(
             do { nc++; av /= 10; } while (av > 0);
             if (nc > max_chars_r) max_chars_r = nc;
         }
-        right_margin = max_chars_r * 7 + 3;
-        if (right_margin < 18) right_margin = 18;
+        right_margin = max_chars_r * 8 + 4;
+        if (right_margin < 20) right_margin = 20;
     }
     int chart_w = SCREEN_W - chart_x - right_margin;
 
@@ -723,32 +947,44 @@ static lv_obj_t *build_chart_generic(
     // Left Y axis labels
     {
         char vbuf[16];
-        for (int i = 0; i < y_label_count; i++) {
-            int val = y_min + i * (y_max - y_min) / y_divs;
-            lv_snprintf(vbuf, sizeof(vbuf), "%d", val);
+        int create_count = y_label_out ? MAX_Y_LABELS : y_label_count;
+        for (int i = 0; i < create_count; i++) {
             lv_obj_t *yl = lv_label_create(parent);
-            lv_label_set_text(yl, vbuf);
             lv_obj_set_style_text_color(yl, lv_color_make(100, 100, 120), 0);
             lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
             lv_obj_set_width(yl, chart_x - 2);
             lv_obj_set_style_text_align(yl, LV_TEXT_ALIGN_RIGHT, 0);
-            int y_pix = CHART_Y + CHART_PAD + content_h - (i * content_h / y_divs) - 6;
-            if (y_pix < 0) y_pix = 0;
-            lv_obj_set_pos(yl, 0, y_pix);
+            if (i < y_label_count) {
+                int val = y_min + i * (y_max - y_min) / y_divs;
+                lv_snprintf(vbuf, sizeof(vbuf), "%d", val);
+                lv_label_set_text(yl, vbuf);
+                int y_pix = CHART_Y + CHART_PAD + content_h - (i * content_h / y_divs) - 6;
+                if (y_pix < 0) y_pix = 0;
+                lv_obj_set_pos(yl, 0, y_pix);
+            } else {
+                lv_label_set_text(yl, "");
+                lv_obj_add_flag(yl, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (y_label_out) y_label_out[i] = yl;
         }
+        if (y_label_count_out) *y_label_count_out = y_label_count;
     }
 
     // Right Y2 axis labels (if dual axis)
     if (has_y2) {
+        int y2_step = nice_step(y2_max - y2_min);
+        int y2_lc = (y2_max - y2_min) / y2_step + 1;
+        if (y2_lc < 3) y2_lc = 3;
+        int y2_divs = y2_lc - 1;
         char vbuf[16];
-        for (int i = 0; i < y_label_count; i++) {
-            int val = y2_min + i * (y2_max - y2_min) / y_divs;
+        for (int i = 0; i < y2_lc; i++) {
+            int val = y2_min + i * (y2_max - y2_min) / y2_divs;
             lv_snprintf(vbuf, sizeof(vbuf), "%d", val);
             lv_obj_t *yl = lv_label_create(parent);
             lv_label_set_text(yl, vbuf);
             lv_obj_set_style_text_color(yl, lv_color_make(100, 100, 120), 0);
             lv_obj_set_style_text_font(yl, &lv_font_montserrat_12, 0);
-            lv_obj_set_pos(yl, chart_x + chart_w + 2, CHART_Y + CHART_PAD + content_h - (i * content_h / y_divs) - 6);
+            lv_obj_set_pos(yl, chart_x + chart_w + 2, CHART_Y + CHART_PAD + content_h - (i * content_h / y2_divs) - 6);
         }
     }
 
@@ -848,13 +1084,357 @@ static void build_nav_bar(lv_obj_t *scr) {
 }
 
 // ============================================================================
-// Build all screens
+// Time setting modal
+// ============================================================================
+static lv_obj_t *time_modal = NULL;
+static lv_obj_t *time_rollers[5] = {NULL}; // hour, min, day, month, year
+
+static void time_ok_cb(lv_event_t *e) {
+    int hour = lv_roller_get_selected(time_rollers[0]);
+    int min = lv_roller_get_selected(time_rollers[1]);
+    int day = lv_roller_get_selected(time_rollers[2]) + 1;
+    int mon = lv_roller_get_selected(time_rollers[3]);
+    int year = lv_roller_get_selected(time_rollers[4]) + 2025;
+
+    struct tm t = {0};
+    t.tm_hour = hour;
+    t.tm_min = min;
+    t.tm_mday = day;
+    t.tm_mon = mon;
+    t.tm_year = year - 1900;
+    time_t unix_ts = mktime(&t);
+    struct timeval tv = { .tv_sec = unix_ts, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+
+    if (time_modal) {
+        lv_obj_delete(time_modal);
+        time_modal = NULL;
+    }
+}
+
+static void time_cancel_cb(lv_event_t *e) {
+    if (time_modal) {
+        lv_obj_delete(time_modal);
+        time_modal = NULL;
+    }
+}
+
+static void status_time_click_cb(lv_event_t *e) {
+    if (time_modal) return; // already open
+
+    lv_obj_t *scr = lv_screen_active();
+    time_modal = lv_obj_create(scr);
+    lv_obj_set_size(time_modal, 320, 200);
+    lv_obj_center(time_modal);
+    lv_obj_set_style_bg_color(time_modal, lv_color_make(25, 25, 40), 0);
+    lv_obj_set_style_bg_opa(time_modal, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(time_modal, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_obj_set_style_border_width(time_modal, 2, 0);
+    lv_obj_set_style_radius(time_modal, 8, 0);
+    lv_obj_set_style_pad_all(time_modal, 8, 0);
+    lv_obj_clear_flag(time_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title
+    lv_obj_t *title = lv_label_create(time_modal);
+    lv_label_set_text(title, "Set Date & Time");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    // Get current time for defaults
+    time_t now = time(NULL);
+    struct tm *ct = localtime(&now);
+    int cur_hour = ct->tm_hour, cur_min = ct->tm_min;
+    int cur_day = ct->tm_mday, cur_mon = ct->tm_mon, cur_year = ct->tm_year + 1900;
+    if (cur_year < 2025) { cur_year = 2026; cur_mon = 0; cur_day = 1; cur_hour = 12; cur_min = 0; }
+
+    // Labels
+    static const char *labels[] = {"Hour", "Min", "Day", "Mon", "Year"};
+    int x_pos[] = {10, 70, 130, 190, 250};
+
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *lbl = lv_label_create(time_modal);
+        lv_label_set_text(lbl, labels[i]);
+        lv_obj_set_style_text_color(lbl, lv_palette_main(LV_PALETTE_CYAN), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_pos(lbl, x_pos[i], 22);
+    }
+
+    // Hour roller (0-23)
+    char hour_opts[24 * 4];
+    hour_opts[0] = '\0';
+    for (int i = 0; i < 24; i++) {
+        char tmp[5];
+        lv_snprintf(tmp, sizeof(tmp), "%02d", i);
+        if (i > 0) strcat(hour_opts, "\n");
+        strcat(hour_opts, tmp);
+    }
+    time_rollers[0] = lv_roller_create(time_modal);
+    lv_roller_set_options(time_rollers[0], hour_opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(time_rollers[0], 3);
+    lv_obj_set_width(time_rollers[0], 50);
+    lv_obj_set_pos(time_rollers[0], 5, 38);
+    lv_obj_set_style_text_font(time_rollers[0], &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(time_rollers[0], lv_color_make(35, 35, 55), 0);
+    lv_obj_set_style_text_color(time_rollers[0], lv_color_white(), 0);
+    lv_obj_set_style_bg_color(time_rollers[0], lv_palette_main(LV_PALETTE_CYAN), LV_PART_SELECTED);
+    lv_roller_set_selected(time_rollers[0], cur_hour, LV_ANIM_OFF);
+
+    // Minute roller (0-59)
+    char min_opts[60 * 4];
+    min_opts[0] = '\0';
+    for (int i = 0; i < 60; i++) {
+        char tmp[5];
+        lv_snprintf(tmp, sizeof(tmp), "%02d", i);
+        if (i > 0) strcat(min_opts, "\n");
+        strcat(min_opts, tmp);
+    }
+    time_rollers[1] = lv_roller_create(time_modal);
+    lv_roller_set_options(time_rollers[1], min_opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(time_rollers[1], 3);
+    lv_obj_set_width(time_rollers[1], 50);
+    lv_obj_set_pos(time_rollers[1], 65, 38);
+    lv_obj_set_style_text_font(time_rollers[1], &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(time_rollers[1], lv_color_make(35, 35, 55), 0);
+    lv_obj_set_style_text_color(time_rollers[1], lv_color_white(), 0);
+    lv_obj_set_style_bg_color(time_rollers[1], lv_palette_main(LV_PALETTE_CYAN), LV_PART_SELECTED);
+    lv_roller_set_selected(time_rollers[1], cur_min, LV_ANIM_OFF);
+
+    // Day roller (1-31)
+    char day_opts[31 * 4];
+    day_opts[0] = '\0';
+    for (int i = 1; i <= 31; i++) {
+        char tmp[5];
+        lv_snprintf(tmp, sizeof(tmp), "%02d", i);
+        if (i > 1) strcat(day_opts, "\n");
+        strcat(day_opts, tmp);
+    }
+    time_rollers[2] = lv_roller_create(time_modal);
+    lv_roller_set_options(time_rollers[2], day_opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(time_rollers[2], 3);
+    lv_obj_set_width(time_rollers[2], 50);
+    lv_obj_set_pos(time_rollers[2], 125, 38);
+    lv_obj_set_style_text_font(time_rollers[2], &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(time_rollers[2], lv_color_make(35, 35, 55), 0);
+    lv_obj_set_style_text_color(time_rollers[2], lv_color_white(), 0);
+    lv_obj_set_style_bg_color(time_rollers[2], lv_palette_main(LV_PALETTE_CYAN), LV_PART_SELECTED);
+    lv_roller_set_selected(time_rollers[2], cur_day - 1, LV_ANIM_OFF);
+
+    // Month roller
+    time_rollers[3] = lv_roller_create(time_modal);
+    lv_roller_set_options(time_rollers[3], "Jan\nFeb\nMar\nApr\nMay\nJun\nJul\nAug\nSep\nOct\nNov\nDec", LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(time_rollers[3], 3);
+    lv_obj_set_width(time_rollers[3], 50);
+    lv_obj_set_pos(time_rollers[3], 185, 38);
+    lv_obj_set_style_text_font(time_rollers[3], &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(time_rollers[3], lv_color_make(35, 35, 55), 0);
+    lv_obj_set_style_text_color(time_rollers[3], lv_color_white(), 0);
+    lv_obj_set_style_bg_color(time_rollers[3], lv_palette_main(LV_PALETTE_CYAN), LV_PART_SELECTED);
+    lv_roller_set_selected(time_rollers[3], cur_mon, LV_ANIM_OFF);
+
+    // Year roller (2025-2035)
+    time_rollers[4] = lv_roller_create(time_modal);
+    lv_roller_set_options(time_rollers[4], "2025\n2026\n2027\n2028\n2029\n2030\n2031\n2032\n2033\n2034\n2035", LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(time_rollers[4], 3);
+    lv_obj_set_width(time_rollers[4], 55);
+    lv_obj_set_pos(time_rollers[4], 245, 38);
+    lv_obj_set_style_text_font(time_rollers[4], &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(time_rollers[4], lv_color_make(35, 35, 55), 0);
+    lv_obj_set_style_text_color(time_rollers[4], lv_color_white(), 0);
+    lv_obj_set_style_bg_color(time_rollers[4], lv_palette_main(LV_PALETTE_CYAN), LV_PART_SELECTED);
+    lv_roller_set_selected(time_rollers[4], cur_year - 2025, LV_ANIM_OFF);
+
+    // OK button
+    lv_obj_t *btn_ok = lv_button_create(time_modal);
+    lv_obj_set_size(btn_ok, 80, 34);
+    lv_obj_set_pos(btn_ok, 70, 148);
+    lv_obj_set_style_bg_color(btn_ok, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_obj_add_event_cb(btn_ok, time_ok_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ok_lbl = lv_label_create(btn_ok);
+    lv_label_set_text(ok_lbl, "OK");
+    lv_obj_center(ok_lbl);
+
+    // Cancel button
+    lv_obj_t *btn_cancel = lv_button_create(time_modal);
+    lv_obj_set_size(btn_cancel, 80, 34);
+    lv_obj_set_pos(btn_cancel, 170, 148);
+    lv_obj_set_style_bg_color(btn_cancel, lv_color_make(80, 80, 100), 0);
+    lv_obj_add_event_cb(btn_cancel, time_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(btn_cancel);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_center(cancel_lbl);
+}
+
+// Lazy screen builder — called on first navigation to a screen
+// ============================================================================
+static const char *x_times[] = {"12:00", "12:15", "12:30", "12:45", "13:00", "13:15", "13:30", "13:45", "14:00", "14:15", "14:30"};
+
+static void build_screen_content(int idx) {
+    // Already holding LVGL lock from switch_screen caller context
+    switch (idx) {
+    case 0:
+        build_params_screen(screens[0]);
+        break;
+    case 1:
+        lv_obj_set_style_pad_all(screens[1], 5, 0);
+        lv_obj_set_style_pad_gap(screens[1], 0, 0);
+        lv_obj_set_scrollbar_mode(screens[1], LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_clear_flag(screens[1], LV_OBJ_FLAG_SCROLL_ELASTIC);
+        lv_obj_add_flag(screens[1], LV_OBJ_FLAG_SCROLLABLE);
+        for (int i = 0; i < NUM_LOG_FILES && i < LOG_LIST_MAX; i++) {
+            lv_obj_t *btn = lv_obj_create(screens[1]);
+            lv_obj_set_size(btn, SCREEN_W - 20, 44);
+            lv_obj_set_pos(btn, 0, i * 50);
+            lv_obj_set_style_bg_color(btn, i == current_log ? lv_color_make(30, 60, 90) : lv_color_make(35, 35, 50), 0);
+            lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(btn, 1, 0);
+            lv_obj_set_style_border_color(btn, i == current_log ? lv_palette_main(LV_PALETTE_CYAN) : lv_color_make(60, 60, 80), 0);
+            lv_obj_set_style_radius(btn, 6, 0);
+            lv_obj_set_style_pad_left(btn, 10, 0);
+            lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(btn, log_list_select_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            lv_obj_t *lbl = lv_label_create(btn);
+            char info_buf[64];
+            int dur = TIMELINE_POINTS;
+            lv_snprintf(info_buf, sizeof(info_buf), "%s  (%dh%02dm)",
+                log_files[i].name, dur / 60, dur % 60);
+            lv_label_set_text(lbl, info_buf);
+            lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
+            log_list_btns[i] = btn;
+            log_list_labels[i] = lbl;
+        }
+        break;
+    case 2: {
+        chart_series_cfg_t temp_series[] = {
+            {"Oil",     lv_palette_main(LV_PALETTE_RED),    disp_oil,     &ser_oil,     LV_CHART_AXIS_PRIMARY_Y},
+            {"Coolant", lv_palette_main(LV_PALETTE_GREEN),  disp_coolant, &ser_coolant, LV_CHART_AXIS_PRIMARY_Y},
+            {"Trans",   lv_palette_main(LV_PALETTE_ORANGE), disp_trans,   &ser_trans,   LV_CHART_AXIS_PRIMARY_Y},
+            {"Ambient", lv_palette_main(LV_PALETTE_BLUE),   disp_ambient, &ser_ambient, LV_CHART_AXIS_PRIMARY_Y},
+        };
+        chart_temp = build_chart_generic(screens[2],
+            "Temperatures (emulated)", -10, 120, "C",
+            x_times, 11, temp_series, 4, 0, 0, RANGE_CHART_H, temp_ser_labels,
+            temp_y_labels, &temp_y_label_count);
+        temp_chart_x = chart_infos[0].chart_x;
+
+        // Range slider
+        {
+            int chart_right = chart_infos[0].chart_x + chart_infos[0].chart_w;
+            int right_gap = SCREEN_W - chart_right + CHART_PAD;
+            range_bar_x = right_gap;
+            range_bar_w = SCREEN_W - 2 * right_gap;
+        }
+        range_bg = lv_obj_create(screens[2]);
+        lv_obj_set_size(range_bg, range_bar_w, RANGE_SLIDER_H);
+        lv_obj_set_pos(range_bg, range_bar_x, RANGE_SLIDER_Y);
+        lv_obj_set_style_bg_color(range_bg, lv_color_make(40, 40, 55), 0);
+        lv_obj_set_style_bg_opa(range_bg, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(range_bg, 1, 0);
+        lv_obj_set_style_border_color(range_bg, lv_color_make(60, 60, 80), 0);
+        lv_obj_set_style_radius(range_bg, 3, 0);
+        lv_obj_set_style_pad_all(range_bg, 0, 0);
+        lv_obj_clear_flag(range_bg, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        range_fill = lv_obj_create(screens[2]);
+        lv_obj_set_style_bg_color(range_fill, lv_palette_main(LV_PALETTE_CYAN), 0);
+        lv_obj_set_style_bg_opa(range_fill, LV_OPA_60, 0);
+        lv_obj_set_style_border_width(range_fill, 0, 0);
+        lv_obj_set_style_radius(range_fill, 3, 0);
+        lv_obj_set_style_pad_all(range_fill, 0, 0);
+        lv_obj_clear_flag(range_fill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        range_hl = lv_obj_create(screens[2]);
+        lv_obj_set_size(range_hl, 8, RANGE_SLIDER_H + 4);
+        lv_obj_set_style_bg_color(range_hl, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(range_hl, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(range_hl, 0, 0);
+        lv_obj_set_style_radius(range_hl, 2, 0);
+        lv_obj_clear_flag(range_hl, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        range_hr = lv_obj_create(screens[2]);
+        lv_obj_set_size(range_hr, 8, RANGE_SLIDER_H + 4);
+        lv_obj_set_style_bg_color(range_hr, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(range_hr, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(range_hr, 0, 0);
+        lv_obj_set_style_radius(range_hr, 2, 0);
+        lv_obj_clear_flag(range_hr, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        range_ll = lv_label_create(screens[2]);
+        lv_obj_set_style_text_color(range_ll, lv_color_make(180, 180, 200), 0);
+        lv_obj_set_style_text_font(range_ll, &lv_font_montserrat_12, 0);
+        lv_label_set_text(range_ll, "8:00");
+
+        range_lr = lv_label_create(screens[2]);
+        lv_obj_set_style_text_color(range_lr, lv_color_make(180, 180, 200), 0);
+        lv_obj_set_style_text_font(range_lr, &lv_font_montserrat_12, 0);
+        lv_label_set_text(range_lr, "10:00");
+
+        log_name_label = lv_label_create(screens[2]);
+        lv_label_set_text(log_name_label, log_files[current_log].name);
+        lv_obj_set_style_text_color(log_name_label, lv_color_make(180, 180, 200), 0);
+        lv_obj_set_style_text_font(log_name_label, &lv_font_montserrat_12, 0);
+        lv_obj_align(log_name_label, LV_ALIGN_TOP_MID, 0, RANGE_SLIDER_Y + RANGE_SLIDER_H + 2);
+
+        update_range_visuals();
+
+        // Touch handlers for chart crosshair + range slider
+        lv_obj_add_event_cb(screens[2], chart_screen_touch_cb, LV_EVENT_PRESSING, NULL);
+        lv_obj_add_event_cb(screens[2], chart_screen_touch_cb, LV_EVENT_RELEASED, NULL);
+        lv_obj_add_event_cb(screens[2], range_touch_cb, LV_EVENT_PRESSING, NULL);
+        lv_obj_add_event_cb(screens[2], range_touch_cb, LV_EVENT_RELEASED, NULL);
+        break;
+    }
+    case 3: {
+        chart_series_cfg_t speed_series[] = {
+            {"RPM",     lv_palette_main(LV_PALETTE_RED),   data_rpm,     &ser_rpm,      LV_CHART_AXIS_PRIMARY_Y},
+            {"Turbine", lv_palette_main(LV_PALETTE_AMBER), data_turbine, &ser_turbine,  LV_CHART_AXIS_PRIMARY_Y},
+            {"km/h",    lv_palette_main(LV_PALETTE_GREEN), data_vspeed,  &ser_veh_speed, LV_CHART_AXIS_SECONDARY_Y},
+        };
+        chart_speed = build_chart_generic(screens[3],
+            "Speed / RPM (emulated)", 0, 4500, "RPM",
+            x_times, 11, speed_series, 3, 0, 200, CHART_H, NULL, NULL, NULL);
+        lv_obj_add_event_cb(screens[3], chart_screen_touch_cb, LV_EVENT_PRESSING, NULL);
+        lv_obj_add_event_cb(screens[3], chart_screen_touch_cb, LV_EVENT_RELEASED, NULL);
+        break;
+    }
+    case 4: {
+        chart_series_cfg_t dyn_series[] = {
+            {"Lat G",  lv_palette_main(LV_PALETTE_RED),   data_lat_g, &ser_lat_g, LV_CHART_AXIS_PRIMARY_Y},
+            {"Yaw",    lv_palette_main(LV_PALETTE_CYAN),  data_yaw,   &ser_yaw,   LV_CHART_AXIS_PRIMARY_Y},
+        };
+        chart_dyn = build_chart_generic(screens[4],
+            "Dynamics (emulated)", -80, 80, "",
+            x_times, 11, dyn_series, 2, 0, 0, CHART_H, NULL, NULL, NULL);
+        lv_obj_add_event_cb(screens[4], chart_screen_touch_cb, LV_EVENT_PRESSING, NULL);
+        lv_obj_add_event_cb(screens[4], chart_screen_touch_cb, LV_EVENT_RELEASED, NULL);
+        break;
+    }
+    case 5: {
+        chart_series_cfg_t susp_series[] = {
+            {"FL", lv_palette_main(LV_PALETTE_RED),    data_lev_fl, &ser_lev_fl, LV_CHART_AXIS_PRIMARY_Y},
+            {"FR", lv_palette_main(LV_PALETTE_GREEN),  data_lev_fr, &ser_lev_fr, LV_CHART_AXIS_PRIMARY_Y},
+            {"RL", lv_palette_main(LV_PALETTE_BLUE),   data_lev_rl, &ser_lev_rl, LV_CHART_AXIS_PRIMARY_Y},
+            {"RR", lv_palette_main(LV_PALETTE_ORANGE), data_lev_rr, &ser_lev_rr, LV_CHART_AXIS_PRIMARY_Y},
+        };
+        chart_susp = build_chart_generic(screens[5],
+            "AIRMATIC Levels (emulated)", 110, 145, "",
+            x_times, 11, susp_series, 4, 0, 0, CHART_H, NULL, NULL, NULL);
+        lv_obj_add_event_cb(screens[5], chart_screen_touch_cb, LV_EVENT_PRESSING, NULL);
+        lv_obj_add_event_cb(screens[5], chart_screen_touch_cb, LV_EVENT_RELEASED, NULL);
+        break;
+    }
+    }
+}
+
+// ============================================================================
+// Build dashboard — only creates base layout + first screen
 // ============================================================================
 static void build_dashboard(void) {
-    static const char *x_times[] = {"12:00", "12:15", "12:30", "12:45", "13:00", "13:15", "13:30", "13:45", "14:00", "14:15", "14:30"};
-
-    // Phase 1: Create base layout + status bar + containers
-    if (lvgl_port_lock(100)) {
+    // Phase 1: Create base layout + status bar + screen containers
+    if (lvgl_port_lock(2000)) {
         lv_obj_t *scr = lv_screen_active();
         lv_obj_clean(scr);
         lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -874,6 +1454,23 @@ static void build_dashboard(void) {
         lv_obj_set_style_text_font(status_bar_label, &lv_font_montserrat_12, 0);
         lv_obj_set_pos(status_bar_label, 5, 0);
 
+        // Clickable time area (tap to set time)
+        lv_obj_t *time_btn = lv_obj_create(sbar);
+        lv_obj_set_size(time_btn, 120, 18);
+        lv_obj_align(time_btn, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_set_style_bg_opa(time_btn, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(time_btn, 0, 0);
+        lv_obj_set_style_pad_all(time_btn, 0, 0);
+        lv_obj_clear_flag(time_btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(time_btn, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(time_btn, status_time_click_cb, LV_EVENT_CLICKED, NULL);
+
+        status_time_label = lv_label_create(time_btn);
+        lv_label_set_text(status_time_label, "--:--");
+        lv_obj_set_style_text_color(status_time_label, lv_color_make(180, 180, 200), 0);
+        lv_obj_set_style_text_font(status_time_label, &lv_font_montserrat_12, 0);
+        lv_obj_align(status_time_label, LV_ALIGN_RIGHT_MID, -5, 0);
+
         for (int i = 0; i < NUM_SCREENS; i++) {
             screens[i] = lv_obj_create(scr);
             lv_obj_set_size(screens[i], SCREEN_W, CONTENT_H);
@@ -886,140 +1483,8 @@ static void build_dashboard(void) {
 
         build_nav_bar(scr);
         current_screen = 0;
-        lvgl_port_unlock();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Phase 2: Parameters screen (many objects)
-    if (lvgl_port_lock(100)) {
-        build_params_screen(screens[0]);
-        lvgl_port_unlock();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Phase 3: Temperatures chart
-    if (lvgl_port_lock(100)) {
-        chart_series_cfg_t temp_series[] = {
-            {"Oil",     lv_palette_main(LV_PALETTE_RED),    disp_oil,     &ser_oil,     LV_CHART_AXIS_PRIMARY_Y},
-            {"Coolant", lv_palette_main(LV_PALETTE_GREEN),  disp_coolant, &ser_coolant, LV_CHART_AXIS_PRIMARY_Y},
-            {"Trans",   lv_palette_main(LV_PALETTE_ORANGE), disp_trans,   &ser_trans,   LV_CHART_AXIS_PRIMARY_Y},
-            {"Ambient", lv_palette_main(LV_PALETTE_BLUE),   disp_ambient, &ser_ambient, LV_CHART_AXIS_PRIMARY_Y},
-        };
-        chart_temp = build_chart_generic(screens[1],
-            "Temperatures (emulated)", -10, 120, "C",
-            x_times, 11, temp_series, 4, 0, 0, RANGE_CHART_H, temp_ser_labels);
-
-        // Range slider on temperatures screen
-        // Make bar symmetric: right margin from screen edge, mirror to left
-        {
-            int chart_right = chart_infos[0].chart_x + chart_infos[0].chart_w;
-            int right_gap = SCREEN_W - chart_right + CHART_PAD;
-            range_bar_x = right_gap;
-            range_bar_w = SCREEN_W - 2 * right_gap;
-        }
-
-        // Background bar (dark)
-        range_bg = lv_obj_create(screens[1]);
-        lv_obj_set_size(range_bg, range_bar_w, RANGE_SLIDER_H);
-        lv_obj_set_pos(range_bg, range_bar_x, RANGE_SLIDER_Y);
-        lv_obj_set_style_bg_color(range_bg, lv_color_make(40, 40, 55), 0);
-        lv_obj_set_style_bg_opa(range_bg, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(range_bg, 1, 0);
-        lv_obj_set_style_border_color(range_bg, lv_color_make(60, 60, 80), 0);
-        lv_obj_set_style_radius(range_bg, 3, 0);
-        lv_obj_set_style_pad_all(range_bg, 0, 0);
-        lv_obj_clear_flag(range_bg, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-
-        // Fill bar (selected range)
-        range_fill = lv_obj_create(screens[1]);
-        lv_obj_set_style_bg_color(range_fill, lv_palette_main(LV_PALETTE_CYAN), 0);
-        lv_obj_set_style_bg_opa(range_fill, LV_OPA_60, 0);
-        lv_obj_set_style_border_width(range_fill, 0, 0);
-        lv_obj_set_style_radius(range_fill, 3, 0);
-        lv_obj_set_style_pad_all(range_fill, 0, 0);
-        lv_obj_clear_flag(range_fill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-
-        // Left handle
-        range_hl = lv_obj_create(screens[1]);
-        lv_obj_set_size(range_hl, 8, RANGE_SLIDER_H + 4);
-        lv_obj_set_style_bg_color(range_hl, lv_color_white(), 0);
-        lv_obj_set_style_bg_opa(range_hl, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(range_hl, 0, 0);
-        lv_obj_set_style_radius(range_hl, 2, 0);
-        lv_obj_clear_flag(range_hl, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-
-        // Right handle
-        range_hr = lv_obj_create(screens[1]);
-        lv_obj_set_size(range_hr, 8, RANGE_SLIDER_H + 4);
-        lv_obj_set_style_bg_color(range_hr, lv_color_white(), 0);
-        lv_obj_set_style_bg_opa(range_hr, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(range_hr, 0, 0);
-        lv_obj_set_style_radius(range_hr, 2, 0);
-        lv_obj_clear_flag(range_hr, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-
-        // Left time label
-        range_ll = lv_label_create(screens[1]);
-        lv_obj_set_style_text_color(range_ll, lv_color_make(180, 180, 200), 0);
-        lv_obj_set_style_text_font(range_ll, &lv_font_montserrat_12, 0);
-        lv_label_set_text(range_ll, "8:00");
-
-        // Right time label
-        range_lr = lv_label_create(screens[1]);
-        lv_obj_set_style_text_color(range_lr, lv_color_make(180, 180, 200), 0);
-        lv_obj_set_style_text_font(range_lr, &lv_font_montserrat_12, 0);
-        lv_label_set_text(range_lr, "10:00");
-
-        update_range_visuals();
-        lvgl_port_unlock();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Phase 4: Speed/RPM chart
-    if (lvgl_port_lock(100)) {
-        chart_series_cfg_t speed_series[] = {
-            {"RPM",     lv_palette_main(LV_PALETTE_RED),   data_rpm,     &ser_rpm,      LV_CHART_AXIS_PRIMARY_Y},
-            {"Turbine", lv_palette_main(LV_PALETTE_AMBER), data_turbine, &ser_turbine,  LV_CHART_AXIS_PRIMARY_Y},
-            {"km/h",    lv_palette_main(LV_PALETTE_GREEN), data_vspeed,  &ser_veh_speed, LV_CHART_AXIS_SECONDARY_Y},
-        };
-        chart_speed = build_chart_generic(screens[2],
-            "Speed / RPM (emulated)", 0, 4500, "RPM",
-            x_times, 11, speed_series, 3, 0, 200, CHART_H, NULL);
-        lvgl_port_unlock();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Phase 5: Dynamics chart
-    if (lvgl_port_lock(100)) {
-        chart_series_cfg_t dyn_series[] = {
-            {"Lat G",  lv_palette_main(LV_PALETTE_RED),   data_lat_g, &ser_lat_g, LV_CHART_AXIS_PRIMARY_Y},
-            {"Yaw",    lv_palette_main(LV_PALETTE_CYAN),  data_yaw,   &ser_yaw,   LV_CHART_AXIS_PRIMARY_Y},
-        };
-        chart_dyn = build_chart_generic(screens[3],
-            "Dynamics (emulated)", -80, 80, "",
-            x_times, 11, dyn_series, 2, 0, 0, CHART_H, NULL);
-        lvgl_port_unlock();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Phase 6: Suspension chart
-    if (lvgl_port_lock(100)) {
-        chart_series_cfg_t susp_series[] = {
-            {"FL", lv_palette_main(LV_PALETTE_RED),    data_lev_fl, &ser_lev_fl, LV_CHART_AXIS_PRIMARY_Y},
-            {"FR", lv_palette_main(LV_PALETTE_GREEN),  data_lev_fr, &ser_lev_fr, LV_CHART_AXIS_PRIMARY_Y},
-            {"RL", lv_palette_main(LV_PALETTE_BLUE),   data_lev_rl, &ser_lev_rl, LV_CHART_AXIS_PRIMARY_Y},
-            {"RR", lv_palette_main(LV_PALETTE_ORANGE), data_lev_rr, &ser_lev_rr, LV_CHART_AXIS_PRIMARY_Y},
-        };
-        chart_susp = build_chart_generic(screens[4],
-            "AIRMATIC Levels (emulated)", 110, 145, "",
-            x_times, 11, susp_series, 4, 0, 0, CHART_H, NULL);
-        lvgl_port_unlock();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Phase 7: Crosshair objects on scr + touch handlers on chart screens
-    if (lvgl_port_lock(100)) {
-        lv_obj_t *scr = lv_screen_active();
-
+        // Crosshair objects (on main scr, shared across chart screens)
         cross_h = lv_obj_create(scr);
         lv_obj_set_style_bg_color(cross_h, lv_color_make(100, 180, 255), 0);
         lv_obj_set_style_bg_opa(cross_h, LV_OPA_COVER, 0);
@@ -1052,14 +1517,9 @@ static void build_dashboard(void) {
         lv_obj_set_style_bg_opa(cross_yl, LV_OPA_80, 0);
         lv_obj_add_flag(cross_yl, LV_OBJ_FLAG_HIDDEN);
 
-        // Touch handlers on chart screens (screens already clickable by default)
-        for (int i = 1; i < NUM_SCREENS; i++) {
-            lv_obj_add_event_cb(screens[i], chart_screen_touch_cb, LV_EVENT_PRESSING, NULL);
-            lv_obj_add_event_cb(screens[i], chart_screen_touch_cb, LV_EVENT_RELEASED, NULL);
-        }
-        // Range slider touch on temperatures screen
-        lv_obj_add_event_cb(screens[1], range_touch_cb, LV_EVENT_PRESSING, NULL);
-        lv_obj_add_event_cb(screens[1], range_touch_cb, LV_EVENT_RELEASED, NULL);
+        // Build only screen 0 (Parameters) at startup
+        build_screen_content(0);
+        screen_built[0] = true;
 
         lvgl_port_unlock();
     }
@@ -1090,6 +1550,20 @@ static void dashboard_timer_cb(lv_timer_t *timer) {
             lv_label_set_text(status_bar_label, "CAN: Not running");
             lv_obj_set_style_text_color(status_bar_label, lv_palette_main(LV_PALETTE_RED), 0);
             lv_obj_set_style_bg_color(lv_obj_get_parent(status_bar_label), lv_color_make(30, 10, 10), 0);
+        }
+    }
+
+    // Update time display
+    if (status_time_label) {
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        if (t->tm_year > (2024 - 1900)) {
+            lv_snprintf(buf, sizeof(buf), "%02d %s %02d:%02d",
+                t->tm_mday,
+                (const char *[]){"Jan","Feb","Mar","Apr","May","Jun",
+                 "Jul","Aug","Sep","Oct","Nov","Dec"}[t->tm_mon],
+                t->tm_hour, t->tm_min);
+            lv_label_set_text(status_time_label, buf);
         }
     }
 
@@ -1410,6 +1884,19 @@ void app_main(void) {
     };
     lvgl_port_add_touch(&touch_cfg);
 
+    // Pre-fill timeline + display buffers from first log file
+    current_log = 0;
+    generate_log_data(0);
+    downsample_range(tl_oil, disp_oil, range_start, range_end);
+    downsample_range(tl_coolant, disp_coolant, range_start, range_end);
+    downsample_range(tl_trans, disp_trans, range_start, range_end);
+    downsample_range(tl_ambient, disp_ambient, range_start, range_end);
+    build_dashboard();
+    if (lvgl_port_lock(1000)) {
+        lv_timer_create(dashboard_timer_cb, 200, NULL);
+        lvgl_port_unlock();
+    }
+
     // CAN Manager (NO_ACK mode — DO NOT CHANGE)
     ESP_LOGI(TAG, "Initializing CAN Manager...");
     if (can_manager_init() != ESP_OK) {
@@ -1422,15 +1909,12 @@ void app_main(void) {
         }
     }
 
-    generate_timeline_data();
-    // Pre-fill display buffers so chart labels position correctly
-    downsample_range(tl_oil, disp_oil, range_start, range_end);
-    downsample_range(tl_coolant, disp_coolant, range_start, range_end);
-    downsample_range(tl_trans, disp_trans, range_start, range_end);
-    downsample_range(tl_ambient, disp_ambient, range_start, range_end);
-    build_dashboard();
-    if (lvgl_port_lock(1000)) {
-        lv_timer_create(dashboard_timer_cb, 200, NULL);
-        lvgl_port_unlock();
-    }
+    // SD Card logger — skip init if no card present
+    // TODO: re-enable when SD card is available
+    // ESP_LOGI(TAG, "Initializing SD card...");
+    // if (sd_logger_init() == ESP_OK) {
+    //     ESP_LOGI(TAG, "SD card ready for logging");
+    // } else {
+    //     ESP_LOGW(TAG, "SD card not available — logging disabled");
+    // }
 }

@@ -1,6 +1,7 @@
 #include "can_driver.h"
 #include "can_sniffer.h"
 #include "mercedes_decode.h"
+#include "sd_logger.h"
 #include "driver/twai.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -10,6 +11,8 @@
 #include <inttypes.h>
 #include <string.h>
 #include "esp_rom_sys.h"
+
+static bool logging_session_active = false;
 
 static const char *TAG = "CAN_DRIVER";
 
@@ -56,6 +59,15 @@ static void can_rx_task(void *arg) {
 
             // Decode known Mercedes broadcast messages
             mercedes_decode_message(message.identifier, message.data, message.data_length_code);
+
+            // Log to SD card
+            if (sd_logger_is_mounted()) {
+                if (!logging_session_active) {
+                    sd_logger_start_session();
+                    logging_session_active = true;
+                }
+                sd_logger_write(message.identifier, message.data, message.data_length_code);
+            }
 
             // Convert TWAI message to our format and queue it
             can_msg.identifier = message.identifier;
@@ -135,6 +147,12 @@ esp_err_t can_driver_deinit(void) {
     }
 
     can_initialized = false;
+
+    // End SD logging session (deletes file if < 5 min)
+    if (logging_session_active) {
+        sd_logger_end_session();
+        logging_session_active = false;
+    }
 
     // Wait for RX task to finish
     if (can_rx_task_handle != NULL) {
